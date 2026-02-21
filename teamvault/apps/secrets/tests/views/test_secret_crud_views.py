@@ -7,33 +7,33 @@ from ..utils import COMMON_OVERRIDES, make_user, new_secret
 
 
 def _detail_url(secret: Secret) -> str:
-    return reverse("secrets.secret-detail", kwargs={"hashid": secret.hashid})
+    return reverse('secrets.secret-detail', kwargs={'hashid': secret.hashid})
 
 
 def _delete_url(secret: Secret) -> str:
-    return reverse("secrets.secret-delete", kwargs={"hashid": secret.hashid})
+    return reverse('secrets.secret-delete', kwargs={'hashid': secret.hashid})
 
 
 def _restore_url(secret: Secret) -> str:
-    return reverse("secrets.secret-restore", kwargs={"hashid": secret.hashid})
+    return reverse('secrets.secret-restore', kwargs={'hashid': secret.hashid})
 
 
 def _share_url(secret: Secret) -> str:
-    return reverse("secrets.secret-share", kwargs={"hashid": secret.hashid})
+    return reverse('secrets.secret-share', kwargs={'hashid': secret.hashid})
 
 
 def _edit_url(secret: Secret) -> str:
-    return reverse("secrets.secret-edit", kwargs={"hashid": secret.hashid})
+    return reverse('secrets.secret-edit', kwargs={'hashid': secret.hashid})
 
 
 @override_settings(**COMMON_OVERRIDES)
 class SecretCrudViewTests(TestCase):
     @classmethod
     def setUpTestData(cls):
-        cls.owner = make_user("owner")
-        cls.bob = make_user("bob")
-        cls.su = make_user("root", superuser=True)
-        cls.secret: Secret = new_secret(cls.owner, name="view-crud")
+        cls.owner = make_user('owner')
+        cls.bob = make_user('bob')
+        cls.su = make_user('root', superuser=True)
+        cls.secret: Secret = new_secret(cls.owner, name='view-crud')
 
     def test_detail_visible_for_owner(self):
         self.client.force_login(self.owner)
@@ -64,7 +64,7 @@ class SecretCrudViewTests(TestCase):
         """
         Behavior:
         - Non-superuser hits @user_passes_test → 302 redirect to login.
-        - Superuser reaches view, but deleted secrets are never visible → 404.
+        - Superuser can view the restore page and restore deleted secrets.
         """
         self.client.force_login(self.owner)
         self.client.post(_delete_url(self.secret))
@@ -76,10 +76,15 @@ class SecretCrudViewTests(TestCase):
         resp_non_su = self.client.post(_restore_url(self.secret))
         self.assertEqual(resp_non_su.status_code, 302)
 
-        # Superuser attempt → 404 due to deleted secrets not being visible
+        # Superuser can view and restore
         self.client.force_login(self.su)
-        resp_su = self.client.post(_restore_url(self.secret))
-        self.assertEqual(resp_su.status_code, 404)
+        resp_su_get = self.client.get(_restore_url(self.secret))
+        self.assertEqual(resp_su_get.status_code, 200)
+
+        resp_su_post = self.client.post(_restore_url(self.secret))
+        self.assertIn(resp_su_post.status_code, (302, 303))
+        self.secret.refresh_from_db()
+        self.assertEqual(self.secret.status, SecretStatus.OK)
 
     def test_share_list_modal_forbidden_for_user_without_share_rights(self):
         """
@@ -109,16 +114,19 @@ class SecretCrudViewTests(TestCase):
         self.secret.refresh_from_db()
         self.assertEqual(self.secret.status, SecretStatus.DELETED)
 
-        # any user hitting detail gets 404 because deleted secrets are never visible
-        for u in (self.owner, self.bob, self.su):
+        # Deleted secrets stay hidden for regular users but are visible to superusers.
+        for u in (self.owner, self.bob):
             self.client.force_login(u)
             resp = self.client.get(_detail_url(self.secret))
             self.assertEqual(resp.status_code, 404)
 
+        self.client.force_login(self.su)
+        resp_su = self.client.get(_detail_url(self.secret))
+        self.assertEqual(resp_su.status_code, 200)
 
     def test_access_policy_any_makes_detail_readable_for_everyone(self):
         self.secret.access_policy = AccessPolicy.ANY
-        self.secret.save(update_fields=["access_policy"])
+        self.secret.save(update_fields=['access_policy'])
 
         self.client.force_login(self.bob)
         resp = self.client.get(_detail_url(self.secret))

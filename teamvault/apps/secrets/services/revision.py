@@ -17,10 +17,10 @@ from teamvault.apps.secrets.enums import AccessPolicy, ContentType, SecretStatus
 from teamvault.apps.secrets.models import (
     AccessPermissionTypes,
     Secret,
-    SecretRevision,
     SecretChange,
+    SecretRevision,
 )
-from teamvault.apps.secrets.utils import apply_snapshot_to_secret, copy_meta_from_secret
+from teamvault.apps.secrets.utils import META_FIELDS, apply_snapshot_to_secret, copy_meta_from_secret
 
 
 @dataclass
@@ -35,6 +35,8 @@ class HistoryEntry:
     change_hash: str
     needs_changing: bool = False
     restored_from: str | None = None
+    scrubbed_by: str | None = None
+    scrubbed_at: datetime | None = None
 
 
 class RevisionService:
@@ -92,7 +94,11 @@ class RevisionService:
         secret.save(update_fields=['current_revision', 'last_changed', 'last_read', 'status'])
 
         # 4. Audit log
-        log_category = AuditLogCategoryChoices.SECRET_CHANGED if payload_changed else AuditLogCategoryChoices.SECRET_METADATA_CHANGED
+        log_category = (
+            AuditLogCategoryChoices.SECRET_CHANGED
+            if payload_changed
+            else AuditLogCategoryChoices.SECRET_METADATA_CHANGED
+        )
         log(
             _("{user} set a new {type} for '{name}' ({oldrev}->{newrev})").format(
                 user=actor.username,
@@ -108,12 +114,7 @@ class RevisionService:
             secret_revision=revision,
         )
         # 5. Record a SecretChange node with snapshot
-        parent = (
-            SecretChange.objects.select_for_update()
-            .filter(secret=secret)
-            .order_by('-created')
-            .first()
-        )
+        parent = SecretChange.objects.select_for_update().filter(secret=secret).order_by('-created').first()
         snapshot = copy_meta_from_secret(secret)
         SecretChange.objects.create(
             secret=secret,
@@ -200,16 +201,17 @@ class RevisionService:
         # merge missing fields for PASSWORD type
         if content_type == ContentType.PASSWORD and secret.current_revision:
             prev = secret.current_revision.peek_data(actor)
-            payload.setdefault('password', prev.get('password'))
-            if 'otp_key' in prev:
-                for fld in ('otp_key', 'digits', 'algorithm'):
-                    payload.setdefault(fld, prev.get(fld))
+            if 'password' not in payload and 'password' in prev:
+                payload['password'] = prev['password']
 
-        sha_src = (
-            payload['password']
-            if content_type == ContentType.PASSWORD and 'password' in payload
-            else dumps(payload, sort_keys=True)
-        )
+            # Preserve OTP fields only when the previous revision actually had them.
+            if 'otp_key' not in payload and 'otp_key' in prev:
+                payload['otp_key'] = prev['otp_key']
+                for fld in ('digits', 'algorithm'):
+                    if fld in prev:
+                        payload[fld] = prev[fld]
+
+        sha_src = dumps(payload, sort_keys=True)
         sha_sum = sha256(sha_src.encode()).hexdigest()
 
         revision, created = SecretRevision.objects.get_or_create(
@@ -238,8 +240,9 @@ class RevisionService:
         Display ordering remains chronological (created desc) for readability.
         """
         changes = list(
-            SecretChange.objects.filter(secret=secret)
-            .select_related('actor', 'revision', 'parent', 'parent__revision')
+            SecretChange.objects
+            .filter(secret=secret)
+            .select_related('actor', 'scrubbed_by', 'revision', 'parent', 'parent__revision')
             .order_by('created')
         )
 
@@ -265,14 +268,14 @@ class RevisionService:
             merged.extend(meta_changes)
 
             # Determine link + current flags
-            is_latest = (ch.id == latest_change_id)
+            is_latest = ch.id == latest_change_id
             if is_latest:
                 # Current state: link to canonical secret detail view
                 link = secret.get_absolute_url()
             else:
                 base_link = reverse('secrets.revision-detail', args=[ch.revision.hashid])
-                link = f"{base_link}?change={ch.hashid}"
-            current = (ch.revision_id == secret.current_revision_id)
+                link = f'{base_link}?change={ch.hashid}'
+            current = ch.revision_id == secret.current_revision_id
 
             rows.append(
                 HistoryEntry(
@@ -286,6 +289,8 @@ class RevisionService:
                     change_hash=ch.hashid,
                     needs_changing=(ch.status == SecretStatus.NEEDS_CHANGING),
                     restored_from=(ch.restored_from.revision.hashid if ch.restored_from_id else None),
+                    scrubbed_by=(ch.scrubbed_by.username if ch.scrubbed_by_id else None),
+                    scrubbed_at=ch.scrubbed_at,
                 )
             )
 
@@ -294,35 +299,56 @@ class RevisionService:
     @classmethod
     @transaction.atomic
     def delete_change(cls, *, change: SecretChange, actor) -> int:
-        """Remove a SecretChange and relink its children to preserve chronology.
+        """Scrub metadata for a SecretChange while keeping the revision reachable.
 
-        Returns the number of child rows that were re-parented.
+        We replace the change's metadata snapshot with its parent's snapshot
+        (if available) so that the history no longer exposes the edited metadata,
+        but the payload revision and chronology remain intact. When there is no
+        parent (first change), we blank optional text fields to purge sensitive
+        content while leaving non-text fields unchanged.
+
+        Returns the number of rows updated (1 when the target change exists).
         """
         if not actor.is_superuser:
             raise PermissionDenied('Only superusers may delete secret history checkpoints')
 
         secret = change.secret
         parent = change.parent
-        relinked = SecretChange.objects.filter(parent=change).update(parent=parent)
+
+        if parent:
+            replacement = {field: getattr(parent, field) for field in META_FIELDS}
+        else:
+            replacement = {
+                'name': change.name,
+                'description': '',
+                'username': '',
+                'url': '',
+                'filename': '',
+                'access_policy': change.access_policy,
+                'needs_changing_on_leave': change.needs_changing_on_leave,
+                'status': change.status,
+            }
+
+        replacement['scrubbed_at'] = now()
+        replacement['scrubbed_by'] = actor
+
+        updated = SecretChange.objects.filter(pk=change.pk).update(**replacement)
 
         log(
-            _("{user} deleted change {change_hash} for '{name}' (relinked {relinked} children)").format(
+            _("{user} scrubbed metadata for change {change_hash} on '{name}'").format(
                 user=actor.username,
                 change_hash=change.hashid,
                 name=secret.name,
-                relinked=relinked,
             ),
             actor=actor,
-            category=AuditLogCategoryChoices.SECRET_CHANGED,
+            category=AuditLogCategoryChoices.SECRET_METADATA_CHANGED,
             level='warning',
             secret=secret,
             secret_revision=change.revision,
-            reason=f'Deleted change {change.hashid}',
+            reason=f'Scrubbed metadata for change {change.hashid}',
         )
 
-        change.delete()
-        return relinked
-
+        return updated
 
     @staticmethod
     def _render_field_label(field_name: str) -> str:
@@ -337,7 +363,7 @@ class RevisionService:
     @staticmethod
     def _render_field_value(value, field_name: str) -> str:
         """Convert field values to human-readable format."""
-        if value in ('', None):
+        if value in {'', None}:
             return '∅'
         if field_name == 'access_policy':
             return AccessPolicy(value).name
@@ -351,38 +377,30 @@ class RevisionService:
         if previous is None:
             return True
 
-        for field, value in snapshot.items():
-            if getattr(previous, field) != value:
-                return True
-        return False
+        return any(getattr(previous, field) != value for field, value in snapshot.items())
 
     @classmethod
     def _get_meta_diff(cls, new_obj: SecretChange, prev_obj: SecretChange | None) -> list[dict]:
         """Compare metadata snapshot between two SecretChange rows."""
-        fields = (
-            'name',
-            'description',
-            'username',
-            'url',
-            'filename',
-            'access_policy',
-            'status',
-            'needs_changing_on_leave',
-        )
-
         diffs = []
-        for field in fields:
+        for field in META_FIELDS:
             old_val = getattr(prev_obj, field, None) if prev_obj else None
             new_val = getattr(new_obj, field, None)
 
             if old_val != new_val:
-                diffs.append(
-                    {
-                        'label': cls._render_field_label(field),
-                        'old': cls._render_field_value(old_val, field),
-                        'new': cls._render_field_value(new_val, field),
-                    }
-                )
+                diffs.append({
+                    'label': cls._render_field_label(field),
+                    'old': cls._render_field_value(old_val, field),
+                    'new': cls._render_field_value(new_val, field),
+                })
+
+        if new_obj.scrubbed_by_id:
+            scrubbed_at = new_obj.scrubbed_at.isoformat() if new_obj.scrubbed_at else '—'
+            diffs.append({
+                'label': 'Scrubbed',
+                'old': '∅',
+                'new': f'by {new_obj.scrubbed_by.username} at {scrubbed_at}',
+            })
 
         return diffs
 
@@ -422,9 +440,11 @@ class RevisionService:
                     if field in sensitive_fields:
                         diffs.append({'label': display_name, 'old': '••••', 'new': '••••'})
                     else:
-                        diffs.append(
-                            {'label': display_name, 'old': old_data.get(field, '∅'), 'new': new_data.get(field, '∅')}
-                        )
+                        diffs.append({
+                            'label': display_name,
+                            'old': old_data.get(field, '∅'),
+                            'new': new_data.get(field, '∅'),
+                        })
 
             return diffs or [{'label': 'Payload', 'old': '∅', 'new': 'Changed'}]
 
